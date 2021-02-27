@@ -1,0 +1,459 @@
+from __future__ import print_function
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.utils.weight_norm import weight_norm
+import torch
+import math
+
+
+def l2norm(X, dim, eps=1e-8):
+    """L2-normalize columns of X
+    """
+    norm = torch.pow(X, 2).sum(dim=dim, keepdim=True).sqrt() + eps
+    X = torch.div(X, norm)
+    return X
+
+class FCNet(nn.Module):
+    """Simple class for non-linear fully connect network
+    """
+    def __init__(self, dims, act='ReLU', dropout=0, bias=True):
+        super(FCNet, self).__init__()
+
+        layers = []
+        for i in range(len(dims)-2):
+            in_dim = dims[i]
+            out_dim = dims[i+1]
+            if 0 < dropout:
+                layers.append(nn.Dropout(dropout))
+            layers.append(weight_norm(nn.Linear(in_dim, out_dim, bias=bias),
+                                      dim=None))
+            if '' != act and act is not None:
+                layers.append(getattr(nn, act)())
+        if 0 < dropout:
+            layers.append(nn.Dropout(dropout))
+        layers.append(weight_norm(nn.Linear(dims[-2], dims[-1], bias=bias),
+                                  dim=None))
+        if '' != act and act is not None:
+            layers.append(getattr(nn, act)())
+
+        self.main = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.main(x)
+
+class GraphSelfAttentionLayer(nn.Module):
+    def __init__(self, feat_dim, nongt_dim=20, pos_emb_dim=-1,
+                 num_heads=16, dropout=[0.2, 0.5]):
+        """ Attetion module with vectorized version
+
+        Args:
+            position_embedding: [num_rois, nongt_dim, pos_emb_dim]
+                                used in implicit relation
+            pos_emb_dim: set as -1 if explicit relation
+            nongt_dim: number of objects consider relations per image
+            fc_dim: should be same as num_heads
+            feat_dim: dimension of roi_feat   feat means featrue
+            num_heads: number of attention heads
+        Returns:
+            output: [num_rois, ovr_feat_dim, output_dim]
+        """
+        super(GraphSelfAttentionLayer, self).__init__()
+        # multi head
+        self.fc_dim = num_heads
+        self.feat_dim = feat_dim
+        self.dim = (256, 256, feat_dim)
+        self.dim_group = (int(self.dim[0] / num_heads),
+                          int(self.dim[1] / num_heads),
+                          int(self.dim[2] / num_heads))
+        self.num_heads = num_heads
+        self.pos_emb_dim = pos_emb_dim
+        if self.pos_emb_dim > 0:
+            self.pair_pos_fc1 = FCNet([pos_emb_dim, self.fc_dim], None, dropout[0])
+        self.query = FCNet([feat_dim, self.dim[0]], None, dropout[0])
+        self.nongt_dim = nongt_dim
+
+        self.key = FCNet([feat_dim, self.dim[1]], None, dropout[0])
+
+        '''self.linear_out_ = weight_norm(
+                            nn.Conv2d(in_channels=self.fc_dim * feat_dim,
+                                      out_channels=self.dim[2],
+                                      kernel_size=(1, 1),
+                                      groups=self.fc_dim), dim=None)'''
+
+    def forward(self, roi_feat, adj_matrix,
+                position_embedding, label_biases_att):
+        """
+        Args:
+            roi_feat: [batch_size, N, feat_dim]     ##猜测N应该是region的数量
+            adj_matrix: [batch_size, N, nongt_dim]
+            position_embedding: [num_rois, nongt_dim, pos_emb_dim]
+        Returns:
+            output: [batch_size, num_rois, ovr_feat_dim, output_dim]
+        """
+
+        batch_size = roi_feat.size(0)
+        num_rois = roi_feat.size(1)
+
+        nongt_dim = self.nongt_dim if self.nongt_dim < num_rois else num_rois
+
+        # [batch_size,nongt_dim, feat_dim]
+        nongt_roi_feat = roi_feat.clone()
+        nongt_roi_feat1 = roi_feat.clone()
+        # nongt_roi_feat = roi_feat[:, :nongt_dim, :]
+
+        # [batch_size,num_rois, self.dim[0] = feat_dim]
+        # 维度还是不变
+        q_data = self.query(roi_feat)
+        # [batch_size,num_rois, num_heads, feat_dim /num_heads]
+        # 这个东西看傻了
+        q_data_batch = q_data.view(batch_size, num_rois, self.num_heads,
+                                   self.dim_group[0])
+        # [batch_size,num_heads, num_rois, feat_dim /num_heads]
+        # 值得学习
+        q_data_batch = torch.transpose(q_data_batch, 1, 2)
+        # [batch_size,nongt_dim, self.dim[1] = feat_dim]
+        k_data = self.key(nongt_roi_feat)
+        # [batch_size,nongt_dim, num_heads, feat_dim /num_heads]
+        k_data_batch = k_data.view(batch_size, nongt_dim, self.num_heads,
+                                   self.dim_group[1])
+        # [batch_size,num_heads, nongt_dim, feat_dim /num_heads]
+        k_data_batch = torch.transpose(k_data_batch, 1, 2)
+        # [batch_size,nongt_dim, feat_dim]
+        v_data = nongt_roi_feat1
+
+        # [batch_size, num_heads, num_rois, nongt_dim]
+        aff = torch.matmul(q_data_batch, torch.transpose(k_data_batch, 2, 3))
+
+        # aff_scale, [batch_size, num_heads, num_rois, nongt_dim]
+        aff_scale = (1.0 / math.sqrt(float(self.dim_group[1]))) * aff
+        # aff_scale, [batch_size,num_rois,num_heads, nongt_dim]
+        aff_scale = torch.transpose(aff_scale, 1, 2)
+        weighted_aff = aff_scale
+
+
+        if position_embedding is not None and self.pos_emb_dim > 0:
+            # Adding goemetric features
+            # 四个log过的还求过cos和sin
+            #print("impli has been used ")
+            position_embedding = position_embedding.float()
+            # [batch_size,num_rois * nongt_dim, emb_dim]
+
+            position_embedding_reshape = position_embedding.reshape(
+                (batch_size, -1, self.pos_emb_dim))
+
+
+            # position_feat_1, [batch_size,num_rois * nongt_dim, fc_dim]
+            position_feat_1 = self.pair_pos_fc1(position_embedding_reshape)
+            position_feat_1_relu = nn.functional.relu(position_feat_1)
+
+            # aff_weight, [batch_size,num_rois, nongt_dim, fc_dim]
+            aff_weight = position_feat_1_relu.view(
+                (batch_size, -1, nongt_dim, self.fc_dim))
+
+            # aff_weight, [batch_size,num_rois, fc_dim, nongt_dim]
+            aff_weight = torch.transpose(aff_weight, 2, 3)
+
+            thresh = torch.FloatTensor([1e-6]).cuda()
+            # weighted_aff, [batch_size,num_rois, fc_dim, nongt_dim]
+            # aff_weight, [batch_size,num_rois, fc_dim, nongt_dim]
+            # fc_dim 就是num_head
+            threshold_aff = torch.max(aff_weight, thresh)
+
+            weighted_aff += torch.log(threshold_aff) ##加号是因为改了log，但是这两个维度加起来真的魔幻
+
+        if adj_matrix is not None:
+            #print("spa hase been used")
+            # weighted_aff_transposed, [batch_size,num_rois, nongt_dim, num_heads]
+            # 表明位置，上下左右的
+            weighted_aff_transposed = torch.transpose(weighted_aff, 2, 3)
+            # 原来是zero_vec = -9e15*torch.ones_like(weighted_aff_transposed)
+            zero_vec = 9e-15*torch.ones_like(weighted_aff_transposed)
+
+            adj_matrix = adj_matrix.view(
+                            adj_matrix.shape[0], adj_matrix.shape[1],
+                            adj_matrix.shape[2], 1)
+            adj_matrix_expand = adj_matrix.expand(
+                                (-1, -1, -1,
+                                 weighted_aff_transposed.shape[-1]))
+            weighted_aff_masked = torch.where(adj_matrix_expand > 0,
+                                              weighted_aff_transposed,
+                                              zero_vec)
+
+            weighted_aff_masked = weighted_aff_masked + \
+                label_biases_att.unsqueeze(3)
+            weighted_aff = torch.transpose(weighted_aff_masked, 2, 3)
+
+        # aff_softmax, [batch_size, num_rois, fc_dim, nongt_dim]
+        aff_softmax = nn.functional.softmax(weighted_aff, 3)
+
+        # aff_softmax_reshape, [batch_size, num_rois*fc_dim, nongt_dim]
+        aff_softmax_reshape = aff_softmax.view((batch_size, -1, nongt_dim))
+        #print(aff_softmax_reshape.size())
+
+        # output_t, [batch_size, num_rois * fc_dim, feat_dim]
+        # v_data, [batch_size,nongt_dim, feat_dim]
+        output_t = torch.matmul(aff_softmax_reshape, v_data)
+
+        output = output_t
+
+
+        '''# output_t, [batch_size*num_rois, fc_dim * feat_dim, 1, 1]
+        output_t = output_t.view((-1, self.fc_dim * self.feat_dim, 1, 1))
+
+        # linear_out, [batch_size*num_rois, dim[2], 1, 1]
+        linear_out = self.linear_out_(output_t)
+        output = linear_out.view((batch_size, num_rois, self.dim[2]))'''
+        return output
+
+
+
+
+
+
+class GAttNet(nn.Module):
+    def __init__(self, label_num, in_feat_dim, out_feat_dim,
+                 nongt_dim=20, dropout=0.2, label_bias=True,
+                 num_heads=16, pos_emb_dim=-1):
+        """ Attetion module with vectorized version
+
+        Args:
+            label_num: numer of edge labels
+            dir_num: number of edge directions
+            feat_dim: dimension of roi_feat
+            pos_emb_dim: dimension of postion embedding for implicit relation, set as -1 for explicit relation
+
+        Returns:
+            output: [num_rois, ovr_feat_dim, output_dim]
+        """
+        super(GAttNet, self).__init__()
+        self.label_num = label_num
+        self.in_feat_dim = in_feat_dim
+        self.out_feat_dim = out_feat_dim
+        self.dropout = nn.Dropout(dropout)
+        #self.self_weights = FCNet([in_feat_dim, out_feat_dim], '', dropout)
+        self.bias = FCNet([label_num, 1], '', 0, label_bias)
+        self.nongt_dim = nongt_dim
+        self.pos_emb_dim = pos_emb_dim
+
+        self.g_att_layer = GraphSelfAttentionLayer(
+                                pos_emb_dim=pos_emb_dim,
+                                num_heads=num_heads,
+                                feat_dim=out_feat_dim,
+                                nongt_dim=nongt_dim)
+        '''    neighbor_net.append(g_att_layer)
+        self.neighbor_net = nn.ModuleList(neighbor_net)'''
+
+    def forward(self, v_feat, adj_matrix, pos_emb=None):
+        """
+        Args:
+            v_feat: [batch_size,num_rois, feat_dim]
+            adj_matrix: [batch_size, num_rois, num_rois, num_labels]
+            pos_emb: [batch_size, num_rois, pos_emb_dim]
+
+        Returns:
+            output: [batch_size, num_rois, feat_dim]
+        """
+        if self.pos_emb_dim > 0 and pos_emb is None:
+            raise ValueError(
+                f"position embedding is set to None "
+                f"with pos_emb_dim {self.pos_emb_dim}")
+        elif self.pos_emb_dim < 0 and pos_emb is not None:
+            raise ValueError(
+                f"position embedding is NOT None "
+                f"with pos_emb_dim < 0")
+        batch_size, num_rois, feat_dim = v_feat.shape
+        nongt_dim = self.nongt_dim
+
+        adj_matrix = adj_matrix.float()
+
+
+        # Self - looping edges
+        # [batch_size,num_rois, out_feat_dim]
+        '''self_feat = self.self_weights(v_feat)
+
+        output = self_feat
+        neighbor_emb = [0] * self.dir_num'''
+
+
+        # [batch_size,num_rois, nongt_dim,label_num]
+        input_adj_matrix = adj_matrix[:, :, :nongt_dim, :]
+        condensed_adj_matrix = torch.sum(input_adj_matrix, dim=-1)
+
+        # [batch_size,num_rois, nongt_dim]
+        # 各种预处理居然是体现在方差上，我人傻了
+        v_biases_neighbors = self.bias(input_adj_matrix).squeeze(-1)
+
+        # [batch_size,num_rois, out_feat_dim]
+        output = self.g_att_layer.forward(
+                        v_feat, condensed_adj_matrix, pos_emb,
+                        v_biases_neighbors)
+
+        # [batch_size,num_rois, out_feat_dim]
+        '''output = output + neighbor_emb[d]'''
+
+
+        #output = self.dropout(output)
+        #output = nn.functional.relu(output)
+
+
+        return output
+
+
+
+
+
+class ImplicitRelationEncoder(nn.Module):
+    def __init__(self, v_dim, q_dim, out_dim, pos_emb_dim,
+                 nongt_dim=36, num_heads=1,
+                 residual_connection=True, label_bias=True):
+        super(ImplicitRelationEncoder, self).__init__()
+        self.v_dim = v_dim
+        self.q_dim = q_dim
+        self.out_dim = out_dim
+        self.residual_connection = residual_connection
+
+        '''print("In ImplicitRelationEncoder, num of graph propogate steps:",
+              "%d, residual_connection: %s" % (self.num_steps,
+                                               self.residual_connection))'''
+
+        if self.v_dim != self.out_dim:
+            self.v_transform = FCNet([v_dim, out_dim])
+        else:
+            self.v_transform = None
+        in_dim = out_dim+q_dim
+        self.FC = FCNet(dims=[1024,1024])
+        self.implicit_relation = GAttNet(1, out_dim, out_dim,
+                                     nongt_dim=nongt_dim,
+                                     label_bias=label_bias,
+                                     num_heads=num_heads,
+                                     pos_emb_dim=pos_emb_dim)
+
+    def forward(self, v, position_embedding):
+        """
+        Args:
+            v: [batch_size, num_rois, v_dim]
+            q: [batch_size, q_dim]
+            position_embedding: [batch_size, num_rois, nongt_dim, emb_dim]
+
+        Returns:
+            output: [batch_size, num_rois, out_dim,3]
+        """
+        # [batch_size, num_rois, num_rois, 1]
+        imp_adj_mat =torch.ones(
+                v.size(0), v.size(1), v.size(1), 1).to(v.device)
+        imp_v = self.v_transform(v) if self.v_transform else v
+
+
+        imp_v_rel = self.implicit_relation.forward(v, imp_adj_mat, position_embedding)
+        imp_v_rel = self.FC(imp_v_rel)
+        if self.residual_connection:
+            imp_v += imp_v_rel
+            #imp_v = l2norm(imp_v, dim=-1)
+        else:
+            imp_v = imp_v_rel
+        return imp_v
+
+
+class ExplicitRelationEncoder(nn.Module):
+    def __init__(self, v_dim, q_dim, out_dim, label_num,
+                 nongt_dim=36, num_heads=1,
+                 residual_connection=True, label_bias=True):
+        super(ExplicitRelationEncoder, self).__init__()
+        self.v_dim = v_dim
+        self.q_dim = q_dim
+        self.out_dim = out_dim
+        self.residual_connection = residual_connection
+        '''print("In ExplicitRelationEncoder, num of graph propogation steps:",
+              "%d, residual_connection: %s" % (self.num_steps,
+                                               self.residual_connection))'''
+
+        if self.v_dim != self.out_dim:
+            self.v_transform = FCNet([v_dim, out_dim])
+        else:
+            self.v_transform = None
+        in_dim = out_dim+q_dim
+        self.FC = FCNet(dims=[1024,1024])
+        self.explicit_relation = GAttNet(label_num, out_dim, out_dim,
+                                     nongt_dim=nongt_dim,
+                                     num_heads=num_heads,
+                                     label_bias=label_bias,
+                                     pos_emb_dim=-1)
+
+    def forward(self, v, exp_adj_matrix):
+        """
+        Args:
+            v: [batch_size, num_rois, v_dim]
+            q: [batch_size, q_dim]
+            exp_adj_matrix: [batch_size, num_rois, num_rois, num_labels] 用0,1表示而非1到。。。表示
+
+        Returns:
+            output: [batch_size, num_rois, out_dim]
+        """
+        exp_v = self.v_transform(v) if self.v_transform else v
+
+        exp_v_rel = self.explicit_relation.forward(v, exp_adj_matrix)
+        #exp_v_rel = self.FC(exp_v_rel)
+        if self.residual_connection:
+            exp_v += exp_v_rel
+            exp_v = l2norm(exp_v, dim=-1)
+            '''exp_v1 = exp_v.clone()
+            exp_v1 = self.FC(exp_v1)
+            exp_v += exp_v1
+            exp_v = l2norm(exp_v, dim=-1)'''
+        else:
+            exp_v1 = exp_v_rel
+        return exp_v
+
+
+
+
+
+
+
+
+class Rs_GCN(nn.Module):
+
+    def __init__(self, in_channels, inter_channels, sem=False, spa=False, implic=False, label_num=11, bn_layer=True):
+        super(Rs_GCN, self).__init__()
+
+        self.spa = spa
+        self.sem = sem
+        self.implic = implic
+
+        if self.spa == True:
+            self.graph1 = ExplicitRelationEncoder(v_dim=in_channels,q_dim=in_channels,out_dim=in_channels, label_num=11)
+            print("spa")
+        if self.sem == True:
+            self.graph2 = ExplicitRelationEncoder(v_dim=in_channels,q_dim=in_channels,out_dim=in_channels, label_num=15)
+            print("sem")
+        if self.implic == True:
+            self.graph3 = ImplicitRelationEncoder(v_dim=in_channels,q_dim=in_channels,out_dim=in_channels, pos_emb_dim=64)
+            print("imp")
+
+
+    def forward(self, v, semantic=None, spcial=None, implicit=None):
+        '''
+        :param v: (B, D, N)
+        :return:
+        '''
+
+        if self.spa == True:
+            W_y1=self.graph1(v, spcial)
+        if self.sem == True:
+            W_y2=self.graph2(v, semantic)
+        if self.implic == True:
+            W_y3=self.graph3(v, implicit)
+        if self.spa == True:
+            # W_y = 0.4 * W_y1 + 0.3 * W_y2 + 0.3 * W_y3
+            W_y = W_y1
+        else:
+            W_y = W_y3
+        return W_y
+
+
+
+
+
+
+
