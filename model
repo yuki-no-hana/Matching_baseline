@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+import torch.nn.init
+import torchvision.models as models
+from torch.autograd import Variable
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import torch.backends.cudnn as cudnn
+from torch.nn.utils.clip_grad import clip_grad_norm
+import numpy as np
+from collections import OrderedDict
+import torch.nn.functional as F
+from attention_model import Rs_GCN
+import opts
+
+
+def l2norm(X, dim, eps=1e-8):
+    """L2-normalize columns of X
+    """
+    try:
+        norm = (torch.pow(X, 2).sum(dim=dim, keepdim=True)+ eps).sqrt()
+    except:
+        print(torch.pow(X, 2).sum(dim=dim, keepdim=True))
+    X = torch.div(X, norm)
+    return X
+
+
+def cosine_similarity(x1, x2, dim=1, eps=1e-8):
+    """Returns cosine similarity between x1 and x2, computed along dim."""
+    w12 = torch.sum(x1 * x2, dim)
+    w1 = torch.norm(x1, 2, dim)
+    w2 = torch.norm(x2, 2, dim)
+    return (w12 / (w1 * w2).clamp(min=eps))
+
+
+def func_attention(query, context, opt, smooth, eps=1e-8, weight=None):
+    """
+    query: (n_context, queryL, d)
+    context: (n_context, sourceL, d)
+    """
+    batch_size_q, queryL = query.size(0), query.size(1)
+    batch_size, sourceL = context.size(0), context.size(1)
+    #print(context.size())
+
+    # Get attention
+    # --> (batch, d, queryL)
+    queryT = torch.transpose(query, 1, 2)
+
+    # (batch, sourceL, d)(batch, d, queryL)
+    # --> (batch, sourceL, queryL)
+    attn = torch.bmm(context, queryT)
+
+    if opt.raw_feature_norm == "softmax":
+        # --> (batch*sourceL, queryL)
+        attn = attn.view(batch_size * sourceL, queryL)
+        attn = 4 * attn
+        attn = F.softmax(attn, dim=1)
+        # --> (batch, sourceL, queryL)
+        attn = attn.view(batch_size, sourceL, queryL)
+    elif opt.raw_feature_norm == "l2norm":
+        attn = l2norm(attn, 2)
+    elif opt.raw_feature_norm == "clipped_l2norm":
+        attn = nn.LeakyReLU(0.1)(attn)
+        attn = l2norm(attn, 2)
+    elif opt.raw_feature_norm == "clipped":
+        attn = nn.LeakyReLU(0.1)(attn)
+    elif opt.raw_feature_norm == "no_norm":
+        pass
+    else:
+        raise ValueError("unknown first norm type:", opt.raw_feature_norm)
+
+    if weight is not None:
+        attn = attn + weight
+
+    attn_out = attn.clone()
+
+    # --> (batch, queryL, sourceL)
+    attn = torch.transpose(attn, 1, 2).contiguous()
+    # --> (batch*queryL, sourceL)
+    attn = attn.view(batch_size * queryL, sourceL)
+
+    attn = F.softmax(attn * smooth, dim=1)
+    # --> (batch, queryL, sourceL)
+    attn = attn.view(batch_size, queryL, sourceL)
+    # --> (batch, sourceL, queryL)
+    attnT = torch.transpose(attn, 1, 2).contiguous()
+
+    # --> (batch, d, sourceL)
+    contextT = torch.transpose(context, 1, 2)
+    # (batch x d x sourceL)(batch x sourceL x queryL)
+    # --> (batch, d, queryL)
+    weightedContext = torch.bmm(contextT, attnT)
+    # --> (batch, queryL, d)
+    weightedContext = torch.transpose(weightedContext, 1, 2)
+    '''print(weightedContext.size())
+    print(query.size())
+    print()'''
+    return weightedContext, attn_out
+
+
