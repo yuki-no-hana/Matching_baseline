@@ -1,0 +1,319 @@
+import torch
+import torch.utils.data as data
+import torchvision.transforms as transforms
+import os
+import nltk
+from PIL import Image
+import numpy as np
+import json as jsonmod
+import codecs
+import json
+import torch.nn as nn
+from collections import OrderedDict
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import torch.nn.functional as F
+import math
+
+
+
+def bb_intersection_over_union(boxA, boxB):
+    ## 返回IOU
+    # determine the (x, y)-coordinates of the intersection rectangle
+    xA = max(boxA[0], boxB[0])      # 左下
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # compute the area of intersection rectangle
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+
+    # compute the area of both the prediction and ground-truth
+    # rectangles
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+
+    # compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the interesection area
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    # return the intersection over union value
+    return iou
+
+def build_graph(bbox, spatial, label_num=11):
+    """ Build spatial graph
+
+    Args:
+        bbox: [num_boxes, 4]
+
+    Returns:
+        adj_matrix: [num_boxes, num_boxes, label_num]
+        我觉得adj_matrix的维度应该是[num_boxes, num_boxes]
+        返回的是spacial graph里每个region之间的空间关系
+
+    """
+
+    num_box = bbox.shape[0]
+    adj_matrix = np.zeros((num_box, num_box))
+    xmin, ymin, xmax, ymax = np.split(bbox, 4, axis=1)
+    # [num_boxes, 1]
+    bbox_width = xmax - xmin + 1.
+    bbox_height = ymax - ymin + 1.
+
+    # 原本的模型是（为了用在matching上改了）
+    # image_h = bbox_height[0]/spatial[0, -1]
+    # image_w = bbox_width[0]/spatial[0, -2]
+    image_h = 1
+    image_w = 1
+    center_x = 0.5 * (xmin + xmax)
+    center_y = 0.5 * (ymin + ymax)
+    # 原本的模型是（为了用在matching上改了）
+    # image_diag = math.sqrt(image_h**2 + image_w**2)
+    image_diag = math.sqrt(image_h**2 + image_w**2)
+    for i in range(num_box):
+        bbA = bbox[i]
+        if sum(bbA) == 0:
+            continue
+        adj_matrix[i, i] = 12
+        for j in range(i+1, num_box):
+            bbB = bbox[j]
+            if sum(bbB) == 0:
+                continue
+            # class 1: inside (j inside i)
+            if xmin[i] < xmin[j] and xmax[i] > xmax[j] and \
+               ymin[i] < ymin[j] and ymax[i] > ymax[j]:
+                adj_matrix[i, j] = 1
+                adj_matrix[j, i] = 2
+            # class 2: cover (j covers i)
+            elif (xmin[j] < xmin[i] and xmax[j] > xmax[i] and
+                  ymin[j] < ymin[i] and ymax[j] > ymax[i]):
+                adj_matrix[i, j] = 2
+                adj_matrix[j, i] = 1
+            else:
+                ioU = bb_intersection_over_union(bbA, bbB)
+                # class 3: i and j overlap
+                if ioU >= 0.5:
+                    adj_matrix[i, j] = 3
+                    adj_matrix[j, i] = 3
+                else:
+                    y_diff = center_y[i] - center_y[j]
+                    x_diff = center_x[i] - center_x[j]
+                    diag = math.sqrt((y_diff)**2 + (x_diff)**2)
+                    if diag < 0.5 * image_diag:
+                        sin_ij = y_diff/diag
+                        cos_ij = x_diff/diag
+                        if sin_ij >= 0 and cos_ij >= 0:
+                            label_i = np.arcsin(sin_ij)
+                            label_j = 2*math.pi - label_i
+                        elif sin_ij < 0 and cos_ij >= 0:
+                            label_i = np.arcsin(sin_ij)+2*math.pi
+                            label_j = label_i - math.pi
+                        elif sin_ij >= 0 and cos_ij < 0:
+                            label_i = np.arccos(cos_ij)
+                            label_j = 2*math.pi - label_i
+                        else:
+                            label_i = -np.arccos(sin_ij)+2*math.pi
+                            label_j = label_i - math.pi
+                        adj_matrix[i, j] = int(np.ceil(label_i/(math.pi/4)))+3
+                        adj_matrix[j, i] = int(np.ceil(label_j/(math.pi/4)))+3
+    return adj_matrix
+
+
+def torch_extract_position_embedding(position_mat, feat_dim=64, wave_length=1000):
+    '''
+        Args:
+            position_matrix: [batch_size, num_boxes, nongt_dim, 4](我觉得第二位和第三维度应该反一下
+            4表示已经计算过log的
+        Returns:
+            embbeding: [batch_size, num_boxes, nongt_dim, 4]
+            我觉得embbeding的维度应该是 [batch_size,num_rois, nongt_dim, feat_dim]
+            最后返回的是对4个已经log了的做sin，cos（4个和2个三角函数乘起来是8这也是为什么feat_dim/8，为了保证出来的东西维度还是feat_dim
+    '''
+    # position_mat, [batch_size,num_rois, nongt_dim, 4]
+    feat_range = torch.arange(0, feat_dim / 8)
+    dim_mat = torch.pow(torch.ones((1,))*wave_length,
+                        (8. / feat_dim) * feat_range)
+    dim_mat = dim_mat.view(1, 1, 1, -1)
+    position_mat = torch.unsqueeze(100.0 * position_mat, dim=4)
+    div_mat = torch.div(position_mat, dim_mat)
+    sin_mat = torch.sin(div_mat)
+    cos_mat = torch.cos(div_mat)
+    # embedding, [batch_size,num_rois, nongt_dim, 4, feat_dim/4]
+    embedding = torch.cat([sin_mat, cos_mat], -1)
+    # embedding, [batch_size,num_rois, nongt_dim, feat_dim]
+    embedding = embedding.view(embedding.shape[0], embedding.shape[1],
+                               embedding.shape[2], feat_dim)
+    return embedding
+
+
+def torch_extract_position_matrix(bbox, nongt_dim=36):
+    """ Extract position matrix
+
+    Args:
+        bbox: [batch_size, num_boxes, 4]
+
+    Returns:
+        position_matrix: [batch_size, num_boxes, nongt_dim, 4]
+        用于IMRAM中num_boxes, nongt_dim两个值是一样的
+    """
+
+    xmin, ymin, xmax, ymax = torch.split(bbox, 1, dim=-1)
+    # [batch_size,num_boxes, 1]
+    bbox_width = xmax - xmin + 1.
+    bbox_height = ymax - ymin + 1.
+    center_x = 0.5 * (xmin + xmax)
+    center_y = 0.5 * (ymin + ymax)
+    # [batch_size,num_boxes, num_boxes]
+    delta_x = center_x-torch.transpose(center_x, 1, 2)
+    delta_x = torch.div(delta_x, bbox_width)
+    delta_x = torch.abs(delta_x)
+    threshold = 1e-3
+    delta_x[delta_x < threshold] = threshold
+    delta_x = torch.log(delta_x)
+
+    delta_y = center_y-torch.transpose(center_y, 1, 2)
+    delta_y = torch.div(delta_y, bbox_height)
+    delta_y = torch.abs(delta_y)
+    delta_y[delta_y < threshold] = threshold
+    delta_y = torch.log(delta_y)
+
+    delta_width = torch.div(bbox_width, torch.transpose(bbox_width, 1, 2))
+    delta_width = torch.log(delta_width)
+
+    delta_height = torch.div(bbox_height, torch.transpose(bbox_height, 1, 2))
+    delta_height = torch.log(delta_height)
+
+    concat_list = [delta_x, delta_y, delta_width, delta_height]
+    for idx, sym in enumerate(concat_list):
+        sym = sym[:, :nongt_dim]    ###最后一维度没有变化
+        concat_list[idx] = torch.unsqueeze(sym, dim=3)      ##又加了一个维度
+    position_matrix = torch.cat(concat_list, 3)
+    return position_matrix
+
+
+def spacial_embedding(data_split):
+    bbx = np.load('./data/f30k_precomp/%s_ims_bbx.npy'% data_split)
+    print(bbx.shape)
+    img=np.load('./data/f30k_precomp/%s_ims_size.npy'% data_split,allow_pickle=True)
+
+    for i,image in enumerate(img):
+        for j in range(36):
+            bbx[i][j][0] = bbx[i][j][0] / image['image_w']
+            bbx[i][j][1] = bbx[i][j][1] / image['image_h']
+            bbx[i][j][2] = bbx[i][j][2] / image['image_w']
+            bbx[i][j][3] = bbx[i][j][3] / image['image_h']
+    spacial=[]
+    for num,i in enumerate(bbx):
+        print(num)
+        spacial.append(build_graph(i, None, label_num=11))
+
+    return spacial
+
+
+def positional_embedding(data_split):
+    bbx = np.load('./data/f30k_precomp/%s_ims_bbx.npy'% data_split)
+    bbx=torch.from_numpy(bbx)
+    print(bbx.shape)
+    img=np.load('./data/f30k_precomp/%s_ims_size.npy'% data_split,allow_pickle=True)
+
+    '''for i,image in enumerate(img):
+        for j in range(36):
+            bbx[i][j][0] = bbx[i][j][0] / image['image_w']
+            bbx[i][j][1] = bbx[i][j][1] / image['image_h']
+            bbx[i][j][2] = bbx[i][j][2] / image['image_w']
+            bbx[i][j][3] = bbx[i][j][3] / image['image_h']'''
+    pos_emb=torch_extract_position_matrix(bbx)
+    pos=torch_extract_position_embedding(pos_emb)
+
+    return pos
+
+def torch_broadcast_adj_matrix(adj_matrix, label_num=11,
+                               device=torch.device("cuda")):
+    """ broudcast spatial relation graph
+
+    Args:
+        adj_matrix: [batch_size,num_boxes, num_boxes]
+
+    Returns:
+        result: [batch_size,num_boxes, num_boxes, label_num]
+        返回每个类别对应的所有region组合
+    """
+    adj_matrix=torch.from_numpy(adj_matrix)
+    result = []
+    for i in range(1, label_num+1):
+        index = torch.nonzero((adj_matrix == i).view(-1).data).squeeze()
+        curr_result = torch.zeros(
+            adj_matrix.shape[0], adj_matrix.shape[1], adj_matrix.shape[2])
+        curr_result = curr_result.view(-1)
+        curr_result[index] += 1
+        result.append(curr_result.view(
+            (adj_matrix.shape[0], adj_matrix.shape[1],
+             adj_matrix.shape[2], 1)))
+    result = torch.cat(result, dim=3)
+    return result
+
+
+
+'''用于得到train，val，test的spacial_embedding'''
+
+'''a=spacial_embedding("test")
+a=np.array(a)
+a=torch_broadcast_adj_matrix(a)
+print(a.shape)
+np.save('./data/test_spacial',a)
+
+a=spacial_embedding("train")
+a=np.array(a)
+a=torch_broadcast_adj_matrix(a)
+print(a.shape)
+np.save('./data/train_spacial',a)
+
+a=spacial_embedding("dev")
+a=np.array(a)
+a=torch_broadcast_adj_matrix(a)
+print(a.shape)
+np.save('./data/dev_spacial',a)'''
+
+
+'''用于得到train，val，test的positional_embedding'''
+
+a=positional_embedding("dev")
+a=a.numpy()
+print(a.shape)
+np.save('./data/dev_positional',a)
+
+a=positional_embedding("train")
+a=a.numpy()
+print(a.shape)
+np.save('./data/train_positional',a)
+
+a=positional_embedding("test")
+a=a.numpy()
+print(a.shape)
+np.save('./data/test_positional',a)
+
+
+def torch_broadcast_adj_matrix(adj_matrix, label_num=11,
+                               device=torch.device("cuda")):
+    """ broudcast spatial relation graph
+
+    Args:
+        adj_matrix: [batch_size,num_boxes, num_boxes]
+
+    Returns:
+        result: [batch_size,num_boxes, num_boxes, label_num]
+        返回每个类别对应的所有region组合
+    """
+    adj_matrix=torch.from_numpy(adj_matrix)
+    result = []
+    for i in range(1, label_num+1):
+        index = torch.nonzero((adj_matrix == i).view(-1).data).squeeze()
+        curr_result = torch.zeros(
+            adj_matrix.shape[0], adj_matrix.shape[1], adj_matrix.shape[2])
+        curr_result = curr_result.view(-1)
+        curr_result[index] += 1
+        result.append(curr_result.view(
+            (adj_matrix.shape[0], adj_matrix.shape[1],
+             adj_matrix.shape[2], 1)))
+    result = torch.cat(result, dim=3)
+    return result
